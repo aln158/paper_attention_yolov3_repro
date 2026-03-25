@@ -1,0 +1,27 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments and tool caches
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Editor files
+.idea/
+.vscode/
+
+# Training artifacts
+outputs*/
+checkpoints/
+runs/
+wandb/
+*.pt
+*.pth
+*.onnx
+
+# Notebook and OS noise
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,72 @@
+{
+  "protocol_name": "utarldd_protocol_a",
+  "description": "Binary protocol: alert vs drowsy.",
+  "source_root": "C:\\Users\\allen\\Desktop\\新建文件夹\\AD4DBR-main\\codes on 100-Driver\\data\\utarldd\\images",
+  "summary": {
+    "splits": {
+      "test": {
+        "subjects": 12,
+        "videos": 25,
+        "frames": 2944,
+        "classes": {
+          "alert": {
+            "subjects": 12,
+            "videos": 12,
+            "frames": 1440
+          },
+          "drowsy": {
+            "subjects": 12,
+            "videos": 13,
+            "frames": 1504
+          }
+        }
+      },
+      "train": {
+        "subjects": 36,
+        "videos": 73,
+        "frames": 8534,
+        "classes": {
+          "alert": {
+            "subjects": 36,
+            "videos": 36,
+            "frames": 4273
+          },
+          "drowsy": {
+            "subjects": 36,
+            "videos": 37,
+            "frames": 4261
+          }
+        }
+      },
+      "val": {
+        "subjects": 12,
+        "videos": 23,
+        "frames": 2760,
+        "classes": {
+          "alert": {
+            "subjects": 11,
+            "videos": 11,
+            "frames": 1320
+          },
+          "drowsy": {
+            "subjects": 12,
+            "videos": 12,
+            "frames": 1440
+          }
+        }
+      }
+    }
+  },
+  "leakage_check": {
+    "subject_overlap": {
+      "test__train": [],
+      "test__val": [],
+      "train__val": []
+    },
+    "video_overlap": {
+      "test__train": [],
+      "test__val": [],
+      "train__val": []
+    }
+  }
+}

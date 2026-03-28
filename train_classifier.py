@@ -11,6 +11,7 @@ from torch import Tensor, nn
 from torchvision import transforms
 
 from repro.data import (
+    ResizeWithPad,
     build_classification_loaders,
     build_manifest_loaders,
     discover_classification_samples,
@@ -56,12 +57,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--resize-mode", choices=("stretch", "letterbox"), default="stretch")
+    parser.add_argument("--augmentation-policy", choices=("default", "paper", "none"), default="default")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--optimizer", choices=("adam", "adamw", "sgd"), default="adam")
     parser.add_argument("--momentum", type=float, default=0.9)
-    parser.add_argument("--scheduler", choices=("none", "cosine"), default="none")
+    parser.add_argument("--nesterov", action="store_true", help="Enable Nesterov momentum for SGD.")
+    parser.add_argument("--scheduler", choices=("none", "cosine", "multistep"), default="none")
     parser.add_argument("--min-lr", type=float, default=1e-6)
+    parser.add_argument(
+        "--lr-milestones",
+        nargs="+",
+        type=int,
+        default=[60, 110],
+        help="Epoch milestones for MultiStepLR. Paper-style schedule uses 60 110 for 150 epochs.",
+    )
+    parser.add_argument(
+        "--lr-gamma",
+        type=float,
+        default=0.1,
+        help="Multiplicative factor for MultiStepLR.",
+    )
     parser.add_argument(
         "--freeze-backbone-epochs",
         type=int,
@@ -96,14 +113,65 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-val-batches", type=int, default=0)
     parser.add_argument("--limit-test-batches", type=int, default=0)
     parser.add_argument("--enable-detection-head", action="store_true")
+    parser.add_argument(
+        "--paper-preset",
+        action="store_true",
+        help="Apply paper-style training settings for the classification-only approximation.",
+    )
     parser.add_argument("--cam-samples", type=int, default=8)
     return parser.parse_args()
+
+
+def apply_paper_classifier_preset(args: argparse.Namespace) -> argparse.Namespace:
+    if not args.paper_preset:
+        return args
+
+    args.model_name = "paper_attention_yolo"
+    args.pretrained = False
+    args.image_size = 416
+    args.resize_mode = "letterbox"
+    args.augmentation_policy = "paper"
+    args.optimizer = "sgd"
+    args.lr = 1e-2
+    args.weight_decay = 5e-4
+    args.momentum = 0.9
+    args.scheduler = "multistep"
+    args.lr_milestones = [60, 110]
+    args.lr_gamma = 0.1
+    args.epochs = 150
+    args.batch_size = 40
+    args.label_smoothing = 0.0
+    args.freeze_backbone_epochs = 0
+    args.early_stopping_patience = 0
+    return args
 
 
 def resolve_normalization(model_name: str) -> Tuple[Optional[Sequence[float]], Optional[Sequence[float]]]:
     if model_name in {"attention_resnet18", "attention_resnet50"}:
         return (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
     return None, None
+
+
+def build_eval_image_transform(
+    image_size: int,
+    resize_mode: str,
+    normalize_mean: Optional[Sequence[float]] = None,
+    normalize_std: Optional[Sequence[float]] = None,
+) -> transforms.Compose:
+    if resize_mode == "letterbox":
+        resize_transform: object = ResizeWithPad(image_size)
+    elif resize_mode == "stretch":
+        resize_transform = transforms.Resize((image_size, image_size))
+    else:
+        raise ValueError(f"Unsupported resize_mode: {resize_mode}")
+
+    transform_steps: List[object] = [
+        resize_transform,
+        transforms.ToTensor(),
+    ]
+    if normalize_mean is not None and normalize_std is not None:
+        transform_steps.append(transforms.Normalize(mean=list(normalize_mean), std=list(normalize_std)))
+    return transforms.Compose(transform_steps)
 
 
 def create_classifier(args: argparse.Namespace, num_classes: int) -> nn.Module:
@@ -140,7 +208,7 @@ def create_optimizer(args: argparse.Namespace, model: nn.Module) -> torch.optim.
             lr=args.lr,
             momentum=args.momentum,
             weight_decay=args.weight_decay,
-            nesterov=True,
+            nesterov=args.nesterov,
         )
     raise ValueError(f"Unsupported optimizer: {args.optimizer}")
 
@@ -153,6 +221,13 @@ def create_scheduler(args: argparse.Namespace, optimizer: torch.optim.Optimizer)
             optimizer,
             T_max=max(args.epochs, 1),
             eta_min=args.min_lr,
+        )
+    if args.scheduler == "multistep":
+        milestones = sorted(set(int(milestone) for milestone in args.lr_milestones if int(milestone) > 0))
+        return torch.optim.lr_scheduler.MultiStepLR(
+            optimizer,
+            milestones=milestones,
+            gamma=args.lr_gamma,
         )
     raise ValueError(f"Unsupported scheduler: {args.scheduler}")
 
@@ -329,6 +404,7 @@ def save_cam_samples(
     output_dir: Path,
     device: torch.device,
     max_samples: int,
+    resize_mode: str = "stretch",
 ) -> List[Path]:
     if max_samples <= 0:
         return []
@@ -348,18 +424,13 @@ def save_cam_samples(
         return []
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    transform = transforms.Compose(
-        [
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-        ]
-    )
+    transform = build_eval_image_transform(image_size=image_size, resize_mode=resize_mode)
 
     saved_paths: List[Path] = []
     for index, row in enumerate(chosen_rows):
         image_path = Path(str(row["frame_path"]))
         raw_image = Image.open(image_path).convert("RGB")
-        resized = raw_image.resize((image_size, image_size))
+        resized = ResizeWithPad(image_size)(raw_image) if resize_mode == "letterbox" else raw_image.resize((image_size, image_size))
         tensor = transform(raw_image).unsqueeze(0).to(device)
         outputs = model(tensor)
         class_index = torch.tensor([int(row["pred_id"])], device=device)
@@ -396,26 +467,28 @@ def save_preview(
     output_dir: Path,
     normalize_mean: Optional[Sequence[float]] = None,
     normalize_std: Optional[Sequence[float]] = None,
+    resize_mode: str = "stretch",
 ) -> Optional[Path]:
     samples = discover_classification_samples(data_root, class_names)
     sample_path, _ = samples[0]
     raw_image = Image.open(sample_path).convert("RGB")
-    transform_steps: List[object] = [
-        transforms.Resize((image_size, image_size)),
-        transforms.ToTensor(),
-    ]
-    if normalize_mean is not None and normalize_std is not None:
-        transform_steps.append(transforms.Normalize(mean=list(normalize_mean), std=list(normalize_std)))
-    transform = transforms.Compose(transform_steps)
+    transform = build_eval_image_transform(
+        image_size=image_size,
+        resize_mode=resize_mode,
+        normalize_mean=normalize_mean,
+        normalize_std=normalize_std,
+    )
     tensor = transform(raw_image).unsqueeze(0).to(device)
     outputs = model(tensor)
     class_indices = outputs["logits"].argmax(dim=1)
     cam = model.compute_cam(outputs["features"], class_indices=class_indices, input_size=(image_size, image_size))
-    return save_cam_overlay(raw_image.resize((image_size, image_size)), cam[0].cpu().numpy(), output_dir / "preview_cam.jpg")
+    resized = ResizeWithPad(image_size)(raw_image) if resize_mode == "letterbox" else raw_image.resize((image_size, image_size))
+    return save_cam_overlay(resized, cam[0].cpu().numpy(), output_dir / "preview_cam.jpg")
 
 
 def main() -> None:
     args = parse_args()
+    args = apply_paper_classifier_preset(args)
     set_seed(args.seed)
     device = torch.device(args.device)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -433,6 +506,8 @@ def main() -> None:
             num_workers=args.num_workers,
             normalize_mean=normalize_mean,
             normalize_std=normalize_std,
+            resize_mode=args.resize_mode,
+            augmentation_policy=args.augmentation_policy,
         )
         source_mode = "manifest"
     else:
@@ -450,6 +525,8 @@ def main() -> None:
             num_workers=args.num_workers,
             normalize_mean=normalize_mean,
             normalize_std=normalize_std,
+            resize_mode=args.resize_mode,
+            augmentation_policy=args.augmentation_policy,
         )
         test_loader = None
         class_names = list(args.classes)
@@ -465,6 +542,8 @@ def main() -> None:
             "model_name": args.model_name,
             "pretrained": args.pretrained,
             "image_size": args.image_size,
+            "resize_mode": args.resize_mode,
+            "augmentation_policy": args.augmentation_policy,
             "batch_size": args.batch_size,
             "epochs": args.epochs,
             "lr": args.lr,
@@ -473,15 +552,19 @@ def main() -> None:
             "momentum": args.momentum,
             "scheduler": args.scheduler,
             "min_lr": args.min_lr,
+            "lr_milestones": list(args.lr_milestones),
+            "lr_gamma": args.lr_gamma,
             "freeze_backbone_epochs": args.freeze_backbone_epochs,
             "selection_metric": args.selection_metric,
             "label_smoothing": args.label_smoothing,
             "early_stopping_patience": args.early_stopping_patience,
             "early_stopping_min_delta": args.early_stopping_min_delta,
+            "nesterov": args.nesterov,
             "normalize_mean": list(normalize_mean) if normalize_mean is not None else None,
             "normalize_std": list(normalize_std) if normalize_std is not None else None,
             "seed": args.seed,
             "device": str(device),
+            "paper_preset": args.paper_preset,
         },
         args.output_dir / "run_config.json",
     )
@@ -499,7 +582,10 @@ def main() -> None:
     history_rows: List[Dict[str, object]] = []
 
     print(f"source_mode={source_mode} classes={class_names}")
-    print(f"model_name={args.model_name} pretrained={args.pretrained} optimizer={args.optimizer} scheduler={args.scheduler}")
+    print(
+        f"model_name={args.model_name} pretrained={args.pretrained} optimizer={args.optimizer} "
+        f"scheduler={args.scheduler} resize_mode={args.resize_mode} aug={args.augmentation_policy}"
+    )
     print(f"training_samples={len(train_loader.dataset)} validation_samples={len(val_loader.dataset)}")
     if test_loader is not None:
         print(f"test_samples={len(test_loader.dataset)}")
@@ -568,6 +654,9 @@ def main() -> None:
         else:
             epochs_without_improvement += 1
 
+        if scheduler is not None:
+            scheduler.step()
+
         if args.early_stopping_patience > 0 and epochs_without_improvement >= args.early_stopping_patience:
             stopped_early = True
             stop_epoch = epoch
@@ -576,9 +665,6 @@ def main() -> None:
                 f"best_epoch={best_epoch} best_{args.selection_metric}={best_metric_value:.4f}"
             )
             break
-
-        if scheduler is not None:
-            scheduler.step()
 
     save_rows_csv(history_rows, args.output_dir / "history.csv")
 
@@ -603,6 +689,7 @@ def main() -> None:
         output_dir=args.output_dir / "cam_samples" / "val",
         device=device,
         max_samples=args.cam_samples,
+        resize_mode=args.resize_mode,
     )
 
     if test_loader is not None:
@@ -623,6 +710,7 @@ def main() -> None:
             output_dir=args.output_dir / "cam_samples" / "test",
             device=device,
             max_samples=args.cam_samples,
+            resize_mode=args.resize_mode,
         )
     else:
         test_cam_paths = []
@@ -637,6 +725,7 @@ def main() -> None:
             output_dir=args.output_dir,
             normalize_mean=normalize_mean,
             normalize_std=normalize_std,
+            resize_mode=args.resize_mode,
         )
         if preview_path is not None:
             print(f"preview_cam={preview_path}")

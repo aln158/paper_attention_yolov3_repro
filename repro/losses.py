@@ -28,10 +28,10 @@ class YoloDetectionLoss(nn.Module):
         anchors: Sequence[Sequence[Tuple[float, float]]],
         num_classes: int,
         image_size: int = 416,
-        box_weight: float = 5.0,
+        box_weight: float = 1.0,
         obj_weight: float = 1.0,
         noobj_weight: float = 0.25,
-        cls_weight: float = 1.0,
+        cls_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.anchors = tuple(tuple(anchor for anchor in scale) for scale in anchors)
@@ -46,7 +46,6 @@ class YoloDetectionLoss(nn.Module):
     def forward(self, predictions: Sequence[Tensor], targets: List[Tensor]) -> Dict[str, Tensor]:
         device = predictions[0].device
         dtype = predictions[0].dtype
-        batch_size = predictions[0].shape[0]
         preds = [reshape_yolo_prediction(pred, self.num_classes, self.anchors_per_scale) for pred in predictions]
 
         obj_targets: List[Tensor] = []
@@ -95,22 +94,14 @@ class YoloDetectionLoss(nn.Module):
                 box_xy_targets[scale_index][batch_index, anchor_index, grid_y, grid_x, 0] = gx - grid_x
                 box_xy_targets[scale_index][batch_index, anchor_index, grid_y, grid_x, 1] = gy - grid_y
 
-                anchor_w, anchor_h = self.anchors[scale_index][anchor_index]
-                anchor_w = (anchor_w / self.image_size) * width
-                anchor_h = (anchor_h / self.image_size) * height
-                box_wh_targets[scale_index][batch_index, anchor_index, grid_y, grid_x, 0] = torch.log(
-                    (gw / max(anchor_w, 1e-6)).clamp_min(1e-6)
-                )
-                box_wh_targets[scale_index][batch_index, anchor_index, grid_y, grid_x, 1] = torch.log(
-                    (gh / max(anchor_h, 1e-6)).clamp_min(1e-6)
-                )
+                box_wh_targets[scale_index][batch_index, anchor_index, grid_y, grid_x, 0] = gw
+                box_wh_targets[scale_index][batch_index, anchor_index, grid_y, grid_x, 1] = gh
 
                 class_index = int(gt_row[0].item())
                 if 0 <= class_index < self.num_classes:
                     cls_targets[scale_index][batch_index, anchor_index, grid_y, grid_x, class_index] = 1.0
 
-        loss_xy = torch.zeros((), device=device, dtype=dtype)
-        loss_wh = torch.zeros((), device=device, dtype=dtype)
+        loss_box = torch.zeros((), device=device, dtype=dtype)
         loss_obj = torch.zeros((), device=device, dtype=dtype)
         loss_cls = torch.zeros((), device=device, dtype=dtype)
 
@@ -123,36 +114,67 @@ class YoloDetectionLoss(nn.Module):
             pred_obj = pred[..., 4]
             pred_cls = pred[..., 5:]
 
-            if pos_mask.any():
-                loss_xy = loss_xy + F.binary_cross_entropy_with_logits(
-                    pred_xy[pos_mask],
-                    box_xy_targets[scale_index][pos_mask],
-                    reduction="sum",
-                )
-                loss_wh = loss_wh + F.smooth_l1_loss(
-                    pred_wh[pos_mask],
-                    box_wh_targets[scale_index][pos_mask],
-                    reduction="sum",
-                )
-                loss_cls = loss_cls + F.binary_cross_entropy_with_logits(
-                    pred_cls[pos_mask],
-                    cls_targets[scale_index][pos_mask],
-                    reduction="sum",
-                )
-
-            obj_weight = torch.full_like(obj_target, self.noobj_weight)
-            obj_weight[pos_mask] = self.obj_weight
-            loss_obj = loss_obj + F.binary_cross_entropy_with_logits(
-                pred_obj,
-                obj_target,
-                weight=obj_weight,
-                reduction="sum",
+            _, anchors_per_scale, height, width, _ = pred.shape
+            anchor_tensor = torch.tensor(self.anchors[scale_index], dtype=dtype, device=device).view(
+                1, anchors_per_scale, 1, 1, 2
             )
+            anchor_tensor = anchor_tensor.clone()
+            anchor_tensor[..., 0] = (anchor_tensor[..., 0] / self.image_size) * width
+            anchor_tensor[..., 1] = (anchor_tensor[..., 1] / self.image_size) * height
 
-        normalizer = max(batch_size, 1)
-        loss_box = (loss_xy + loss_wh) * self.box_weight / normalizer
-        loss_obj = loss_obj / normalizer
-        loss_cls = loss_cls * self.cls_weight / normalizer
+            if pos_mask.any():
+                positive_count = pos_mask.sum().to(dtype=dtype).clamp_min(1.0)
+                pred_xy_decoded = pred_xy.sigmoid()
+                expanded_anchor_tensor = anchor_tensor.expand(pred.shape[0], -1, height, width, -1)
+                target_wh_log = torch.log(
+                    box_wh_targets[scale_index].clamp_min(1e-6) / expanded_anchor_tensor.clamp_min(1e-6)
+                )
+                target_wh_log = target_wh_log.clamp(min=-6.0, max=6.0)
+
+                loss_box = loss_box + (
+                    F.mse_loss(
+                        pred_xy_decoded[pos_mask],
+                        box_xy_targets[scale_index][pos_mask],
+                        reduction="sum",
+                    )
+                    + F.mse_loss(
+                        pred_wh[pos_mask],
+                        target_wh_log[pos_mask],
+                        reduction="sum",
+                    )
+                ) / positive_count
+
+                if self.cls_weight > 0.0 and pred_cls.shape[-1] > 0:
+                    cls_target_ids = cls_targets[scale_index][pos_mask].argmax(dim=-1)
+                    loss_cls = loss_cls + F.cross_entropy(
+                        pred_cls[pos_mask],
+                        cls_target_ids,
+                        reduction="mean",
+                    )
+
+            negative_mask = ~pos_mask
+            if pos_mask.any():
+                positive_obj_loss = F.binary_cross_entropy_with_logits(
+                    pred_obj[pos_mask],
+                    obj_target[pos_mask],
+                    reduction="mean",
+                )
+            else:
+                positive_obj_loss = torch.zeros((), device=device, dtype=dtype)
+
+            if negative_mask.any():
+                negative_obj_loss = F.binary_cross_entropy_with_logits(
+                    pred_obj[negative_mask],
+                    obj_target[negative_mask],
+                    reduction="mean",
+                )
+            else:
+                negative_obj_loss = torch.zeros((), device=device, dtype=dtype)
+
+            loss_obj = loss_obj + self.obj_weight * positive_obj_loss + self.noobj_weight * negative_obj_loss
+
+        loss_box = loss_box * self.box_weight
+        loss_cls = loss_cls * self.cls_weight
         total = loss_box + loss_obj + loss_cls
 
         return {

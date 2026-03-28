@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import random
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -11,9 +12,68 @@ from PIL import Image
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as TF
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
+VIDEO_DIR_PATTERN = re.compile(
+    r"^(?P<fold_name>Fold(?P<fold>\d+)_part(?P<part>\d+))__(?P=fold_name)__(?P<subject>[^_]+)__(?P<clip>.+)$",
+    re.IGNORECASE,
+)
+
+
+class ResizeWithPad:
+    def __init__(self, image_size: int, fill: Tuple[int, int, int] = (0, 0, 0)) -> None:
+        self.image_size = image_size
+        self.fill = fill
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            raise ValueError(f"Invalid image size: {(width, height)}")
+
+        scale = min(self.image_size / float(width), self.image_size / float(height))
+        resized_width = max(1, int(round(width * scale)))
+        resized_height = max(1, int(round(height * scale)))
+        resized = image.resize((resized_width, resized_height), Image.BILINEAR)
+
+        canvas = Image.new(image.mode, (self.image_size, self.image_size), self.fill)
+        pad_left = (self.image_size - resized_width) // 2
+        pad_top = (self.image_size - resized_height) // 2
+        canvas.paste(resized, (pad_left, pad_top))
+        return canvas
+
+
+def resize_yolo_sample_with_pad(image: Image.Image, labels: Tensor, image_size: int) -> Tuple[Image.Image, Tensor]:
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Invalid image size: {(width, height)}")
+
+    scale = min(image_size / float(width), image_size / float(height))
+    resized_width = max(1, int(round(width * scale)))
+    resized_height = max(1, int(round(height * scale)))
+    resized = image.resize((resized_width, resized_height), Image.BILINEAR)
+
+    canvas = Image.new(image.mode, (image_size, image_size), (0, 0, 0))
+    pad_left = (image_size - resized_width) // 2
+    pad_top = (image_size - resized_height) // 2
+    canvas.paste(resized, (pad_left, pad_top))
+
+    if labels.numel() == 0:
+        return canvas, labels
+
+    updated = labels.clone()
+    x_center = labels[:, 1] * float(width) * scale + float(pad_left)
+    y_center = labels[:, 2] * float(height) * scale + float(pad_top)
+    box_width = labels[:, 3] * float(width) * scale
+    box_height = labels[:, 4] * float(height) * scale
+
+    updated[:, 1] = x_center / float(image_size)
+    updated[:, 2] = y_center / float(image_size)
+    updated[:, 3] = box_width / float(image_size)
+    updated[:, 4] = box_height / float(image_size)
+    return canvas, updated
 
 
 class ClassificationFolderDataset(Dataset):
@@ -67,17 +127,14 @@ class YoloDetectionDataset(Dataset):
         images_dir: Path,
         labels_dir: Path,
         image_size: int,
+        resize_mode: str = "stretch",
         transform: Optional[Callable] = None,
     ) -> None:
         self.images_dir = Path(images_dir)
         self.labels_dir = Path(labels_dir)
         self.image_size = image_size
-        self.transform = transform or transforms.Compose(
-            [
-                transforms.Resize((image_size, image_size)),
-                transforms.ToTensor(),
-            ]
-        )
+        self.resize_mode = resize_mode
+        self.transform = transform
         self.samples = self._discover_samples()
 
     def _discover_samples(self) -> List[Tuple[Path, Path]]:
@@ -93,12 +150,56 @@ class YoloDetectionDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> Tuple[Tensor, Tensor]:
+    def __getitem__(self, index: int) -> Tuple[Tensor, Tensor, Dict[str, str]]:
         image_path, label_path = self.samples[index]
         image = Image.open(image_path).convert("RGB")
-        image = self.transform(image)
         labels = read_yolo_label_file(label_path)
-        return image, labels
+        metadata = self._build_metadata(image_path=image_path, label_path=label_path)
+        if self.transform is not None:
+            image = self.transform(image)
+            return image, labels, metadata
+
+        if self.resize_mode == "letterbox":
+            image, labels = resize_yolo_sample_with_pad(image, labels, self.image_size)
+        elif self.resize_mode == "stretch":
+            image = image.resize((self.image_size, self.image_size), Image.BILINEAR)
+        else:
+            raise ValueError(f"Unsupported resize_mode: {self.resize_mode}")
+
+        image = TF.to_tensor(image)
+        return image, labels, metadata
+
+    def _build_metadata(self, image_path: Path, label_path: Path) -> Dict[str, str]:
+        relative_path = image_path.relative_to(self.images_dir)
+        class_name = relative_path.parts[0] if len(relative_path.parts) >= 1 else "unknown"
+        video_id = relative_path.parts[1] if len(relative_path.parts) >= 2 else image_path.parent.name
+        subject_id = video_id
+        fold_name = ""
+        fold = ""
+        part = ""
+        clip_id = ""
+
+        match = VIDEO_DIR_PATTERN.match(video_id)
+        if match:
+            subject_id = match.group("subject")
+            fold_name = match.group("fold_name")
+            fold = match.group("fold")
+            part = match.group("part")
+            clip_id = match.group("clip")
+
+        return {
+            "frame_path": str(image_path),
+            "label_path": str(label_path),
+            "frame_name": image_path.name,
+            "video_id": video_id,
+            "subject_id": subject_id,
+            "class_name": class_name,
+            "split": self.images_dir.parent.name,
+            "fold_name": fold_name,
+            "fold": fold,
+            "part": part,
+            "clip_id": clip_id,
+        }
 
 
 def read_yolo_label_file(label_path: Path) -> Tensor:
@@ -189,15 +290,47 @@ def build_classification_transforms(
     image_size: int,
     normalize_mean: Optional[Sequence[float]] = None,
     normalize_std: Optional[Sequence[float]] = None,
+    resize_mode: str = "stretch",
+    augmentation_policy: str = "default",
 ) -> Tuple[Callable, Callable]:
-    train_steps: List[Callable] = [
-        transforms.Resize((image_size, image_size)),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
-        transforms.ToTensor(),
-    ]
+    if resize_mode == "letterbox":
+        resize_transform: Callable = ResizeWithPad(image_size)
+    elif resize_mode == "stretch":
+        resize_transform = transforms.Resize((image_size, image_size), interpolation=InterpolationMode.BILINEAR)
+    else:
+        raise ValueError(f"Unsupported resize_mode: {resize_mode}")
+
+    if augmentation_policy == "paper":
+        train_steps: List[Callable] = [
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomAffine(
+                degrees=10,
+                translate=(0.05, 0.05),
+                scale=(0.9, 1.1),
+                interpolation=InterpolationMode.BILINEAR,
+                fill=0,
+            ),
+            resize_transform,
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.ToTensor(),
+        ]
+    elif augmentation_policy == "none":
+        train_steps = [
+            resize_transform,
+            transforms.ToTensor(),
+        ]
+    elif augmentation_policy == "default":
+        train_steps = [
+            resize_transform,
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
+            transforms.ToTensor(),
+        ]
+    else:
+        raise ValueError(f"Unsupported augmentation_policy: {augmentation_policy}")
+
     eval_steps: List[Callable] = [
-        transforms.Resize((image_size, image_size)),
+        resize_transform,
         transforms.ToTensor(),
     ]
     if normalize_mean is not None and normalize_std is not None:
@@ -220,6 +353,8 @@ def build_classification_loaders(
     num_workers: int = 0,
     normalize_mean: Optional[Sequence[float]] = None,
     normalize_std: Optional[Sequence[float]] = None,
+    resize_mode: str = "stretch",
+    augmentation_policy: str = "default",
 ) -> Tuple[DataLoader, DataLoader]:
     samples = discover_classification_samples(Path(dataset_root), class_names)
     train_samples, val_samples = stratified_split(samples, val_ratio=val_ratio, seed=seed)
@@ -227,6 +362,8 @@ def build_classification_loaders(
         image_size,
         normalize_mean=normalize_mean,
         normalize_std=normalize_std,
+        resize_mode=resize_mode,
+        augmentation_policy=augmentation_policy,
     )
 
     train_dataset = ClassificationFolderDataset(train_samples, class_names=class_names, transform=train_transform)
@@ -258,6 +395,8 @@ def build_manifest_loaders(
     test_manifest: Optional[Path] = None,
     normalize_mean: Optional[Sequence[float]] = None,
     normalize_std: Optional[Sequence[float]] = None,
+    resize_mode: str = "stretch",
+    augmentation_policy: str = "default",
 ) -> Tuple[DataLoader, DataLoader, Optional[DataLoader], List[str]]:
     train_rows = read_manifest_rows(train_manifest)
     val_rows = read_manifest_rows(val_manifest)
@@ -268,6 +407,8 @@ def build_manifest_loaders(
         image_size,
         normalize_mean=normalize_mean,
         normalize_std=normalize_std,
+        resize_mode=resize_mode,
+        augmentation_policy=augmentation_policy,
     )
     train_dataset = ManifestClassificationDataset(train_rows, transform=train_transform)
     val_dataset = ManifestClassificationDataset(val_rows, transform=eval_transform)
@@ -299,6 +440,8 @@ def build_manifest_loaders(
     return train_loader, val_loader, test_loader, class_names
 
 
-def detection_collate_fn(batch: Iterable[Tuple[Tensor, Tensor]]) -> Tuple[Tensor, List[Tensor]]:
-    images, labels = zip(*batch)
-    return torch.stack(list(images), dim=0), list(labels)
+def detection_collate_fn(
+    batch: Iterable[Tuple[Tensor, Tensor, Dict[str, str]]]
+) -> Tuple[Tensor, List[Tensor], List[Dict[str, str]]]:
+    images, labels, metadata = zip(*batch)
+    return torch.stack(list(images), dim=0), list(labels), list(metadata)

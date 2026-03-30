@@ -49,7 +49,17 @@ def parse_args() -> argparse.Namespace:
         default="paper_attention_yolo",
         help="Classifier architecture to train.",
     )
-    parser.add_argument("--pretrained", action="store_true", help="Use torchvision ImageNet pretrained weights when supported.")
+    parser.add_argument(
+        "--pretrained",
+        action="store_true",
+        help="Use pretrained backbone weights when supported. paper_attention_yolo loads official Darknet-53 conv.74 weights.",
+    )
+    parser.add_argument(
+        "--pretrained-backbone-path",
+        type=Path,
+        default=None,
+        help="Optional local path to pretrained backbone weights for paper_attention_yolo.",
+    )
     parser.add_argument("--protocol", default="utarldd_protocol_a", help="Protocol directory under ./protocols")
     parser.add_argument("--train-manifest", type=Path, default=None)
     parser.add_argument("--val-manifest", type=Path, default=None)
@@ -127,7 +137,6 @@ def apply_paper_classifier_preset(args: argparse.Namespace) -> argparse.Namespac
         return args
 
     args.model_name = "paper_attention_yolo"
-    args.pretrained = False
     args.image_size = 416
     args.resize_mode = "letterbox"
     args.augmentation_policy = "paper"
@@ -180,6 +189,8 @@ def create_classifier(args: argparse.Namespace, num_classes: int) -> nn.Module:
             num_classes=num_classes,
             detection_num_classes=num_classes,
             enable_detection=args.enable_detection_head,
+            pretrained_backbone=args.pretrained,
+            pretrained_backbone_path=args.pretrained_backbone_path,
         )
     if args.model_name == "attention_resnet18":
         return AttentionResNetClassifier(
@@ -531,6 +542,9 @@ def main() -> None:
         test_loader = None
         class_names = list(args.classes)
 
+    model = create_classifier(args, num_classes=len(class_names)).to(device)
+    pretrained_source = getattr(model, "pretrained_backbone_source", None)
+
     save_json(
         {
             "source_mode": source_mode,
@@ -541,6 +555,8 @@ def main() -> None:
             "classes": list(class_names),
             "model_name": args.model_name,
             "pretrained": args.pretrained,
+            "pretrained_backbone_path": str(args.pretrained_backbone_path) if args.pretrained_backbone_path else None,
+            "resolved_pretrained_backbone_path": pretrained_source,
             "image_size": args.image_size,
             "resize_mode": args.resize_mode,
             "augmentation_policy": args.augmentation_policy,
@@ -569,7 +585,6 @@ def main() -> None:
         args.output_dir / "run_config.json",
     )
 
-    model = create_classifier(args, num_classes=len(class_names)).to(device)
     maybe_set_backbone_trainable(model, trainable=args.freeze_backbone_epochs == 0)
     optimizer = create_optimizer(args, model)
     scheduler = create_scheduler(args, optimizer)
@@ -586,6 +601,8 @@ def main() -> None:
         f"model_name={args.model_name} pretrained={args.pretrained} optimizer={args.optimizer} "
         f"scheduler={args.scheduler} resize_mode={args.resize_mode} aug={args.augmentation_policy}"
     )
+    if pretrained_source is not None:
+        print(f"pretrained_backbone_source={pretrained_source}")
     print(f"training_samples={len(train_loader.dataset)} validation_samples={len(val_loader.dataset)}")
     if test_loader is not None:
         print(f"test_samples={len(test_loader.dataset)}")

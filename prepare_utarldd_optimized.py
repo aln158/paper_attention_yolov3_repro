@@ -39,9 +39,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--sampling-mode",
-        choices=("uniform", "time_step"),
+        choices=("uniform", "tail_uniform", "time_step"),
         default="uniform",
-        help="uniform covers the whole video more evenly; time_step mimics fixed-interval extraction.",
+        help="uniform covers the whole video evenly; tail_uniform samples evenly from the last part of the video; time_step mimics fixed-interval extraction.",
     )
     parser.add_argument(
         "--frames-per-video",
@@ -54,6 +54,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Used only when sampling-mode=time_step.",
+    )
+    parser.add_argument(
+        "--tail-fraction",
+        type=float,
+        default=0.5,
+        help="Used only when sampling-mode=tail_uniform. 0.5 means sample from the last half of each video.",
     )
     parser.add_argument("--resize-width", type=int, default=320, help="Output image width. Use 0 to keep original size.")
     parser.add_argument("--resize-height", type=int, default=240, help="Output image height. Use 0 to keep original size.")
@@ -157,6 +163,19 @@ def sample_uniform_indices(frame_count: int, max_frames: int) -> List[int]:
     return unique_sorted([round(index * (frame_count - 1) / (target - 1)) for index in range(target)])
 
 
+def sample_tail_uniform_indices(frame_count: int, max_frames: int, tail_fraction: float) -> List[int]:
+    if frame_count <= 0:
+        return []
+    clamped_fraction = min(max(tail_fraction, 1e-3), 1.0)
+    start_index = int(round(frame_count * (1.0 - clamped_fraction)))
+    start_index = min(max(start_index, 0), max(frame_count - 1, 0))
+    tail_frame_count = frame_count - start_index
+    if tail_frame_count <= 0:
+        return sample_uniform_indices(frame_count, max_frames)
+    tail_indices = sample_uniform_indices(tail_frame_count, max_frames)
+    return [start_index + index for index in tail_indices]
+
+
 def sample_time_step_indices(frame_count: int, fps: float, frame_step_seconds: float, max_frames: int) -> List[int]:
     if frame_count <= 0:
         return []
@@ -187,6 +206,7 @@ def extract_frames_for_video(
     sampling_mode: str,
     frames_per_video: int,
     frame_step_seconds: float,
+    tail_fraction: float,
     resize_width: int,
     resize_height: int,
     jpeg_quality: int,
@@ -201,10 +221,12 @@ def extract_frames_for_video(
 
     if sampling_mode == "uniform" and frame_count > 0:
         selected_indices = sample_uniform_indices(frame_count, frames_per_video)
+    elif sampling_mode == "tail_uniform" and frame_count > 0:
+        selected_indices = sample_tail_uniform_indices(frame_count, frames_per_video, tail_fraction)
     elif sampling_mode == "time_step" and frame_count > 0:
         selected_indices = sample_time_step_indices(frame_count, fps, frame_step_seconds, frames_per_video)
     else:
-        if sampling_mode == "uniform":
+        if sampling_mode in {"uniform", "tail_uniform"}:
             print(f"[WARN] Unknown frame count for {video_path.name}; falling back to time_step sampling.")
         selected_indices = []
 
@@ -315,6 +337,7 @@ def main() -> None:
                 sampling_mode=args.sampling_mode,
                 frames_per_video=args.frames_per_video,
                 frame_step_seconds=args.frame_step_seconds,
+                tail_fraction=args.tail_fraction,
                 resize_width=args.resize_width,
                 resize_height=args.resize_height,
                 jpeg_quality=args.jpeg_quality,
@@ -343,6 +366,7 @@ def main() -> None:
         "sampling_mode": args.sampling_mode,
         "frames_per_video": args.frames_per_video,
         "frame_step_seconds": args.frame_step_seconds,
+        "tail_fraction": args.tail_fraction,
         "resize_width": args.resize_width,
         "resize_height": args.resize_height,
         "jpeg_quality": args.jpeg_quality,

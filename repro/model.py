@@ -1,11 +1,23 @@
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+from urllib.request import Request, urlopen
+import html
+import re
 
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 from torchvision import models
+
+
+DARKNET53_CONV74_URLS = (
+    "https://data.pjreddie.com/files/darknet53.conv.74",
+    "https://pjreddie.com/media/files/darknet53.conv.74",
+    "http://pjreddie.com/media/files/darknet53.conv.74",
+    "https://sourceforge.net/projects/yolov3.mirror/files/v8/darknet53.conv.74/download",
+)
 
 
 class ConvBNAct(nn.Module):
@@ -100,6 +112,104 @@ class Darknet53Backbone(nn.Module):
         c5 = self.stage5(x)
         return c3, c4, c5
 
+    def conv_bn_blocks(self) -> List[ConvBNAct]:
+        blocks: List[ConvBNAct] = []
+
+        def collect(module: nn.Module) -> None:
+            for child in module.children():
+                if isinstance(child, ConvBNAct):
+                    blocks.append(child)
+                else:
+                    collect(child)
+
+        collect(self)
+        return blocks
+
+    def load_pretrained(self, weights_path: Optional[Path] = None) -> Path:
+        return load_darknet53_backbone_weights(self, weights_path=weights_path)
+
+
+def default_darknet53_weights_path() -> Path:
+    return Path.home() / ".paper_attention_yolo_models" / "darknet53.conv.74"
+
+
+def ensure_darknet53_weights(weights_path: Optional[Path] = None) -> Path:
+    def write_response_to_path(response, destination: Path) -> None:
+        with destination.open("wb") as handle:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+
+    resolved_path = (weights_path or default_darknet53_weights_path()).expanduser().resolve()
+    if resolved_path.exists():
+        return resolved_path
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    last_error: Optional[Exception] = None
+    for url in DARKNET53_CONV74_URLS:
+        try:
+            request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(request) as response:
+                content_type = response.info().get_content_type()
+                if content_type == "text/html":
+                    html_text = response.read().decode("utf-8", errors="ignore")
+                    match = re.search(r'http-equiv="refresh" content="[^"]*url=([^"]+)"', html_text, flags=re.IGNORECASE)
+                    if match is None:
+                        raise RuntimeError(f"Failed to resolve download redirect from {url}")
+                    redirected_url = html.unescape(match.group(1))
+                    redirected_request = Request(redirected_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urlopen(redirected_request) as redirected_response:
+                        write_response_to_path(redirected_response, resolved_path)
+                else:
+                    write_response_to_path(response, resolved_path)
+            return resolved_path
+        except Exception as exc:  # pragma: no cover - network failure path
+            last_error = exc
+            if resolved_path.exists():
+                resolved_path.unlink()
+    raise RuntimeError("Failed to download Darknet-53 pretrained weights.") from last_error
+
+
+def read_darknet_weights(weights_path: Path):
+    import numpy as np
+
+    with weights_path.open("rb") as handle:
+        header = np.fromfile(handle, dtype=np.int32, count=3)
+        if header.size != 3:
+            raise ValueError(f"Invalid Darknet weights header: {weights_path}")
+        major, minor = int(header[0]), int(header[1])
+        if (major * 10 + minor) >= 2 and major < 1000 and minor < 1000:
+            _ = np.fromfile(handle, dtype=np.int64, count=1)
+        else:
+            _ = np.fromfile(handle, dtype=np.int32, count=1)
+        return np.fromfile(handle, dtype=np.float32)
+
+
+@torch.no_grad()
+def load_darknet53_backbone_weights(backbone: Darknet53Backbone, weights_path: Optional[Path] = None) -> Path:
+    import numpy as np
+
+    resolved_path = ensure_darknet53_weights(weights_path)
+    weights = read_darknet_weights(resolved_path)
+    pointer = 0
+
+    for block in backbone.conv_bn_blocks():
+        conv = block.block[0]
+        bn = block.block[1]
+        for tensor in (bn.bias, bn.weight, bn.running_mean, bn.running_var, conv.weight):
+            numel = tensor.numel()
+            if pointer + numel > weights.size:
+                raise ValueError(
+                    f"Darknet weights file ended early while loading {tensor.shape} from {resolved_path}"
+                )
+            array = weights[pointer : pointer + numel]
+            pointer += numel
+            source = torch.from_numpy(np.asarray(array)).view_as(tensor).to(dtype=tensor.dtype)
+            tensor.copy_(source)
+
+    return resolved_path
+
 
 class SpatialAttentionGate(nn.Module):
     def __init__(self, channels: int, gamma_init: float = 1.0) -> None:
@@ -145,12 +255,16 @@ class AttentionYOLOv3Drowsiness(nn.Module):
         anchors_per_scale: int = 3,
         enable_detection: bool = True,
         classifier_dropout: float = 0.2,
+        pretrained_backbone: bool = False,
+        pretrained_backbone_path: Optional[Path] = None,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
         self.detection_num_classes = detection_num_classes if detection_num_classes is not None else num_classes
         self.anchors_per_scale = anchors_per_scale
         self.enable_detection = enable_detection
+        self.pretrained_backbone = pretrained_backbone
+        self.pretrained_backbone_source: Optional[str] = None
 
         self.backbone = Darknet53Backbone()
         self.attention = SpatialAttentionGate(1024)
@@ -172,6 +286,10 @@ class AttentionYOLOv3Drowsiness(nn.Module):
                 nn.Upsample(scale_factor=2, mode="nearest"),
             )
             self.head_small = DetectionHeadBlock(128 + 256, 128, det_out)
+
+        if pretrained_backbone:
+            loaded_path = self.backbone.load_pretrained(weights_path=pretrained_backbone_path)
+            self.pretrained_backbone_source = str(loaded_path)
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
         c3, c4, c5 = self.backbone(x)
@@ -231,7 +349,8 @@ class AttentionYOLOv3Drowsiness(nn.Module):
             f"num_classes={self.num_classes}, "
             f"detection_num_classes={self.detection_num_classes}, "
             f"anchors_per_scale={self.anchors_per_scale}, "
-            f"enable_detection={self.enable_detection}"
+            f"enable_detection={self.enable_detection}, "
+            f"pretrained_backbone={self.pretrained_backbone}"
         )
 
     def set_backbone_trainable(self, trainable: bool) -> None:

@@ -37,6 +37,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-images", type=Path, default=None)
     parser.add_argument("--test-labels", type=Path, default=None)
     parser.add_argument("--class-names", nargs="+", default=None)
+    parser.add_argument(
+        "--pretrained",
+        action="store_true",
+        help="Load official Darknet-53 conv.74 backbone weights for paper_attention_yolo.",
+    )
+    parser.add_argument(
+        "--pretrained-backbone-path",
+        type=Path,
+        default=None,
+        help="Optional local path to Darknet-53 conv.74 weights. If omitted, the weights are downloaded automatically.",
+    )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--image-size", type=int, default=416)
@@ -463,7 +474,10 @@ def main() -> None:
         num_classes=args.num_classes,
         detection_num_classes=args.num_classes,
         enable_detection=True,
+        pretrained_backbone=args.pretrained,
+        pretrained_backbone_path=args.pretrained_backbone_path,
     ).to(device)
+    pretrained_source = getattr(model, "pretrained_backbone_source", None)
     optimizer = create_optimizer(args, model)
     scheduler = create_scheduler(args, optimizer)
 
@@ -477,6 +491,9 @@ def main() -> None:
             "test_labels": str(args.test_labels) if args.test_labels else None,
             "class_names": list(class_names),
             "num_classes": args.num_classes,
+            "pretrained": args.pretrained,
+            "pretrained_backbone_path": str(args.pretrained_backbone_path) if args.pretrained_backbone_path else None,
+            "resolved_pretrained_backbone_path": pretrained_source,
             "image_size": args.image_size,
             "resize_mode": args.resize_mode,
             "batch_size": args.batch_size,
@@ -512,9 +529,11 @@ def main() -> None:
 
     print(f"class_names={class_names}")
     print(
-        f"optimizer={args.optimizer} scheduler={args.scheduler} lr={args.lr} "
+        f"pretrained={args.pretrained} optimizer={args.optimizer} scheduler={args.scheduler} lr={args.lr} "
         f"weight_decay={args.weight_decay} resize_mode={args.resize_mode}"
     )
+    if pretrained_source is not None:
+        print(f"pretrained_backbone_source={pretrained_source}")
     print(f"training_samples={len(train_loader.dataset)}")
     if val_loader is not None:
         print(f"validation_samples={len(val_loader.dataset)}")
